@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+Starts a game in a contained process tree, waits for the game to start,
+gently tries to close other game processes when the main game has exited.
+"""
+
+import ctypes
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from ctypes.util import find_library
+
+from lutris.util.log import logger
+from lutris.util.process_watcher import ProcessWatcher
+
+try:
+    from setproctitle import setproctitle
+except ImportError:
+    setproctitle = print
+
+
+PR_SET_CHILD_SUBREAPER = 36  # Value of the constant in prctl.h
+
+
+class NoMoreChildren(Exception):
+    """Raised when async_reap_children finds no children left"""
+
+
+def set_child_subreaper():
+    """Sets the current process to a subreaper.
+
+    A subreaper fulfills the role of init(1) for its descendant
+    processes.  When a process becomes orphaned (i.e., its
+    immediate parent terminates) then that process will be
+    reparented to the nearest still living ancestor subreaper.
+    Subsequently, calls to getppid() in the orphaned process will
+    now return the PID of the subreaper process, and when the
+    orphan terminates, it is the subreaper process that will
+    receive a SIGCHLD signal and will be able to wait(2) on the
+    process to discover its termination status.
+
+    The setting of this bit is not inherited by children created
+    by fork(2) and clone(2).  The setting is preserved across
+    execve(2).
+
+    Establishing a subreaper process is useful in session
+    management frameworks where a hierarchical group of processes
+    is managed by a subreaper process that needs to be informed
+    when one of the processes—for example, a double-forked daemon—
+    terminates (perhaps so that it can restart that process).
+    Some init(1) frameworks (e.g., systemd(1)) employ a subreaper
+    process for similar reasons.
+    """
+    result = ctypes.CDLL(find_library('c')).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0, 0)
+    if result == -1:
+        print("PR_SET_CHILD_SUBREAPER is not supported by your kernel (Linux 3.4 and above)")
+
+
+def log(log_message):
+    """Generic log function that can be adjusted for any log output method
+    (stdout, file, logging, ...)
+    """
+    line = str(log_message) + "\n"
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
+    # File output
+    # with open(os.path.expanduser("~/lutris.log"), "a") as logfile:
+    #     logfile.write(line)
+
+
+def kill_pid(pid, sigkill=False):
+    """Attempt to kill a process with SIGTERM or SIGKILL"""
+    if sigkill:
+        _signal = signal.SIGKILL
+    else:
+        _signal = signal.SIGTERM
+    log("Killing PID %s with %s" % (pid, "SIGKILL" if sigkill else "SIGTERM"))
+    try:
+        os.kill(pid, _signal)
+    except ProcessLookupError:  # process already dead
+        pass
+
+
+def main():
+    """Runs a command independently from the Lutris client"""
+    # pylint: disable=too-many-branches,too-many-statements
+    # TODO: refactor
+    set_child_subreaper()
+    _script_name, proc_title, include_proc_count, exclude_proc_count, *args = sys.argv
+
+    setproctitle("lutris-wrapper: " + proc_title)
+
+    # So I'm too lazy to implement real argument parsing... sorry.
+    include_proc_count = int(include_proc_count)
+    exclude_proc_count = int(exclude_proc_count)
+    include_procs, args = args[:include_proc_count], args[include_proc_count:]
+    exclude_procs, args = args[:exclude_proc_count], args[exclude_proc_count:]
+
+    if "PYTHONPATH" in os.environ:
+        del os.environ["PYTHONPATH"]
+    watcher = ProcessWatcher(include_procs, exclude_procs)
+
+    def hard_sig_handler(signum, _frame):
+        log("Caught another signal, sending SIGKILL.")
+        for _ in range(3):  # just in case we race a new process.
+            for child in watcher.iterate_children():
+                kill_pid(child.pid, sigkill=True)
+
+    def sig_handler(signum, _frame):
+        log("Caught signal %s" % signum)
+        signal.signal(signal.SIGTERM, hard_sig_handler)
+        signal.signal(signal.SIGINT, hard_sig_handler)
+        for child in watcher.iterate_children():
+            kill_pid(child.pid, signum == signal.SIGKILL)
+        log("--terminated processes--")
+
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    returncode = None
+    try:
+        process_pid = subprocess.Popen(args).pid
+    except FileNotFoundError:
+        log("Failed to execute process '%s'. Check that the file exists" % " ".join(args))
+        return
+    log("Started initial process %d from %s" % (process_pid, " ".join(args)))
+
+    def reap_children(message=None):
+        """
+        Attempts to reap zombie child processes. Thanks to setting
+        ourselves as a subreaper, we are assigned zombie processes
+        that our children orphan and so we are responsible for
+        clearing them.
+
+        This is also how we determine what our main process' exit
+        code was so that we can forward it to our caller.
+        """
+        nonlocal returncode
+        if message:
+            log(message)
+        while True:
+            try:
+                child_pid, child_returncode, _resource_usage = os.wait3(os.WNOHANG)
+            except ChildProcessError:
+                raise NoMoreChildren from None  # No processes remain.
+            if child_pid == process_pid:
+                if returncode:
+                    log("Reassigning returncode, which is very weird but you'll have to deal with it.")
+                returncode = child_returncode
+                log("Initial process has exited (return code: %s)" % child_returncode)
+
+            if child_pid == 0:
+                break
+
+    log("Start monitoring process.")
+    try:
+        # The initial wait loop:
+        #  the initial process may have been excluded. Wait for the game
+        #  to be considered "started".
+        if not watcher.is_alive():
+            log("Waiting for game to start (first non-excluded process started)")
+            while not watcher.is_alive():
+                reap_children()
+                time.sleep(0.1)
+        while watcher.is_alive():
+            reap_children()
+            time.sleep(0.1)
+        log("Monitored process exited.")
+        reap_children()
+
+    except NoMoreChildren:
+        log("All processes have quit")
+
+    if returncode is None:
+        returncode = 0
+        log("No return code")
+    else:
+        log("Exit with return code %s" % returncode)
+    if "LUTRIS_GAME_UUID" in os.environ:
+        with open("/tmp/lutris-%s" % os.environ["LUTRIS_GAME_UUID"], "w") as status_file:
+            status_file.write("%s" % returncode)
+    sys.exit(returncode)
+
+
+if __name__ == "__main__":
+    LAUNCH_PATH = os.path.dirname(os.path.realpath(__file__))
+    if os.path.isdir(os.path.join(LAUNCH_PATH, "../lutris")):
+        logger.setLevel(logging.DEBUG)
+        sys.dont_write_bytecode = True
+        SOURCE_PATH = os.path.normpath(os.path.join(LAUNCH_PATH, '..'))
+        sys.path.insert(0, SOURCE_PATH)
+    else:
+        sys.path.insert(0, os.path.normpath(os.path.join(LAUNCH_PATH, "../lib/lutris")))
+
+    main()
